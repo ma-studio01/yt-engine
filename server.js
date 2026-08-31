@@ -67,7 +67,7 @@ app.get('/download/mp3', (req, res) => {
   proc.stdout.pipe(res);
   proc.stderr.on('data', () => {});
   proc.on('error', e => { if (!res.headersSent) res.status(500).json({ error: e.message }); });
-  proc.on('close', code => { if (!res.writableEnded) res.end(); });
+  proc.on('close', () => { if (!res.writableEnded) res.end(); });
   req.on('close', () => { try { proc.kill('SIGKILL'); } catch(e) {} });
 });
 
@@ -92,11 +92,6 @@ app.get('/stream/mp3', (req, res) => {
   req.on('close', () => { try { proc.kill('SIGKILL'); } catch(e) {} });
 });
 
-
-
-app.listen(PORT, () => console.log(`MA Studio YT Engine v5 on port ${PORT}`));
-
-// Publish langsung ke Roblox dari server (bypass browser timeout)
 app.post('/publish/roblox', async (req, res) => {
   const { url, title, apiKey } = req.body;
   if (!url) return res.status(400).json({ error: 'URL required' });
@@ -104,7 +99,6 @@ app.post('/publish/roblox', async (req, res) => {
 
   const name = (title || 'audio').slice(0, 100);
 
-  // Step 1: Download MP3 via yt-dlp ke buffer
   let audioBuffer;
   try {
     audioBuffer = await new Promise((resolve, reject) => {
@@ -127,7 +121,6 @@ app.post('/publish/roblox', async (req, res) => {
     return res.status(500).json({ error: 'Gagal download audio: ' + e.message });
   }
 
-  // Step 2: Upload ke Roblox Open Cloud pakai multipart manual
   try {
     const boundary = '----MAStudioBoundary' + Date.now();
     const requestJson = JSON.stringify({
@@ -138,12 +131,8 @@ app.post('/publish/roblox', async (req, res) => {
     });
 
     const bodyParts = [];
-    bodyParts.push(Buffer.from(
-      `--${boundary}\r\nContent-Disposition: form-data; name="request"\r\nContent-Type: application/json\r\n\r\n${requestJson}\r\n`
-    ));
-    bodyParts.push(Buffer.from(
-      `--${boundary}\r\nContent-Disposition: form-data; name="fileContent"; filename="${name}.mp3"\r\nContent-Type: audio/mpeg\r\n\r\n`
-    ));
+    bodyParts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="request"\r\nContent-Type: application/json\r\n\r\n${requestJson}\r\n`));
+    bodyParts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="fileContent"; filename="${name}.mp3"\r\nContent-Type: audio/mpeg\r\n\r\n`));
     bodyParts.push(audioBuffer);
     bodyParts.push(Buffer.from(`\r\n--${boundary}--\r\n`));
     const body = Buffer.concat(bodyParts);
@@ -168,7 +157,6 @@ app.post('/publish/roblox', async (req, res) => {
 
     if (uploadData.assetId) return res.json({ assetId: uploadData.assetId });
 
-    // Poll operation
     const opPath = uploadData.path || uploadData.operationId;
     if (!opPath) return res.status(500).json({ error: 'Respons Roblox tidak valid.' });
 
@@ -190,3 +178,5 @@ app.post('/publish/roblox', async (req, res) => {
     return res.status(500).json({ error: 'Gagal upload ke Roblox: ' + e.message });
   }
 });
+
+app.listen(PORT, () => console.log(`MA Studio YT Engine v5 on port ${PORT}`));
