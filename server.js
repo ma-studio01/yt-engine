@@ -57,7 +57,7 @@ app.get('/download/mp3', (req, res) => {
   res.setHeader('Content-Disposition', `attachment; filename="${safe}.mp3"`);
   res.setHeader('Content-Type', 'audio/mpeg');
   res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('X-Accel-Buffering', 'no'); // matiin buffering di proxy/nginx
+  res.setHeader('X-Accel-Buffering', 'no');
   const proc = spawn('yt-dlp', [
     '--no-warnings', '--no-playlist',
     '-f', 'bestaudio[ext=m4a]/bestaudio',
@@ -67,7 +67,7 @@ app.get('/download/mp3', (req, res) => {
   proc.stdout.pipe(res);
   proc.stderr.on('data', () => {});
   proc.on('error', e => { if (!res.headersSent) res.status(500).json({ error: e.message }); });
-  proc.on('close', code => { if (code !== 0 && !res.headersSent) res.status(500).json({ error: 'yt-dlp failed' }); });
+  proc.on('close', code => { if (!res.writableEnded) res.end(); });
   req.on('close', () => { try { proc.kill('SIGKILL'); } catch(e) {} });
 });
 
@@ -75,20 +75,21 @@ app.get('/stream/mp3', (req, res) => {
   const { url } = req.query;
   if (!url) return res.status(400).json({ error: 'URL required' });
   res.setHeader('Content-Type', 'audio/mpeg');
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Expose-Headers', '*');
-  res.setHeader('Accept-Ranges', 'bytes');
+  res.setHeader('Accept-Ranges', 'none');
   res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.setHeader('Transfer-Encoding', 'chunked');
   const proc = spawn('yt-dlp', [
     '--no-warnings', '--no-playlist',
-    '-f', 'bestaudio',
+    '-f', 'bestaudio[ext=m4a]/bestaudio',
     '--extract-audio', '--audio-format', 'mp3', '--audio-quality', '128K',
     '-o', '-', url
   ]);
   proc.stdout.pipe(res);
   proc.stderr.on('data', () => {});
   proc.on('error', e => { if (!res.headersSent) res.status(500).json({ error: e.message }); });
-  req.on('close', () => { try { proc.kill(); } catch(e) {} });
+  proc.on('close', () => { if (!res.writableEnded) res.end(); });
+  req.on('close', () => { try { proc.kill('SIGKILL'); } catch(e) {} });
 });
 
 
