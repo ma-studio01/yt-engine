@@ -28,6 +28,8 @@ app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, HEAD');
   res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Range, Authorization');
   res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition, Content-Length, Content-Type, Content-Range, Accept-Ranges');
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  res.setHeader('Cross-Origin-Embedder-Policy', 'unsafe-none');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
@@ -83,21 +85,46 @@ app.head('/stream/mp3', (req, res) => {
 app.get('/stream/mp3', (req, res) => {
   const { url } = req.query;
   if (!url) return res.status(400).json({ error: 'URL required' });
+
   res.setHeader('Content-Type', 'audio/mpeg');
   res.setHeader('Accept-Ranges', 'none');
-  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Cache-Control', 'no-cache, no-store');
   res.setHeader('X-Accel-Buffering', 'no');
   res.setHeader('Transfer-Encoding', 'chunked');
+
+  let headersSent = false;
+  let stderr = '';
+
   const proc = spawn('yt-dlp', [
-    '--no-warnings', '--no-playlist',
-    '-f', 'bestaudio[ext=m4a]/bestaudio',
+    '--no-warnings', '--no-playlist', '--no-cache-dir',
+    '--retries', '3',
+    '--extractor-retries', '3',
+    '-f', 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
     '--extract-audio', '--audio-format', 'mp3', '--audio-quality', '128K',
     '-o', '-', url
   ]);
-  proc.stdout.pipe(res);
-  proc.stderr.on('data', () => {});
-  proc.on('error', e => { if (!res.headersSent) res.status(500).json({ error: e.message }); });
-  proc.on('close', () => { if (!res.writableEnded) res.end(); });
+
+  proc.stdout.on('data', chunk => {
+    if (!headersSent) { headersSent = true; }
+    if (!res.writableEnded) res.write(chunk);
+  });
+
+  proc.stderr.on('data', d => { stderr += d.toString(); });
+
+  proc.on('error', e => {
+    console.error('[stream/mp3] spawn error:', e.message);
+    if (!res.headersSent) res.status(500).json({ error: e.message });
+  });
+
+  proc.on('close', code => {
+    if (code !== 0 && !headersSent) {
+      console.error('[stream/mp3] yt-dlp failed, code:', code, stderr.slice(-300));
+      if (!res.headersSent) res.status(500).json({ error: 'yt-dlp failed: ' + stderr.slice(-200) });
+    } else {
+      if (!res.writableEnded) res.end();
+    }
+  });
+
   req.on('close', () => { try { proc.kill('SIGKILL'); } catch(e) {} });
 });
 
