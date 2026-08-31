@@ -22,10 +22,12 @@ setInterval(() => {
 }, 4 * 60 * 1000);
 
 app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', '*');
-  res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition, Content-Length, Content-Type');
+  const origin = req.headers.origin || '*';
+  res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, HEAD');
+  res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Range, Authorization');
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition, Content-Length, Content-Type, Content-Range, Accept-Ranges');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
@@ -69,6 +71,13 @@ app.get('/download/mp3', (req, res) => {
   proc.on('error', e => { if (!res.headersSent) res.status(500).json({ error: e.message }); });
   proc.on('close', () => { if (!res.writableEnded) res.end(); });
   req.on('close', () => { try { proc.kill('SIGKILL'); } catch(e) {} });
+});
+
+app.head('/stream/mp3', (req, res) => {
+  res.setHeader('Content-Type', 'audio/mpeg');
+  res.setHeader('Accept-Ranges', 'none');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.end();
 });
 
 app.get('/stream/mp3', (req, res) => {
