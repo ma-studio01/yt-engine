@@ -56,18 +56,19 @@ app.get('/download/mp3', (req, res) => {
   const safe = (title || 'audio').replace(/[^\w\s\-]/g, '').trim().slice(0, 100) || 'audio';
   res.setHeader('Content-Disposition', `attachment; filename="${safe}.mp3"`);
   res.setHeader('Content-Type', 'audio/mpeg');
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('X-Accel-Buffering', 'no'); // matiin buffering di proxy/nginx
   const proc = spawn('yt-dlp', [
     '--no-warnings', '--no-playlist',
-    '-f', 'bestaudio',
+    '-f', 'bestaudio[ext=m4a]/bestaudio',
     '--extract-audio', '--audio-format', 'mp3', '--audio-quality', '128K',
     '-o', '-', url
   ]);
   proc.stdout.pipe(res);
   proc.stderr.on('data', () => {});
   proc.on('error', e => { if (!res.headersSent) res.status(500).json({ error: e.message }); });
-  req.on('close', () => { try { proc.kill(); } catch(e) {} });
+  proc.on('close', code => { if (code !== 0 && !res.headersSent) res.status(500).json({ error: 'yt-dlp failed' }); });
+  req.on('close', () => { try { proc.kill('SIGKILL'); } catch(e) {} });
 });
 
 app.get('/stream/mp3', (req, res) => {
@@ -90,33 +91,6 @@ app.get('/stream/mp3', (req, res) => {
   req.on('close', () => { try { proc.kill(); } catch(e) {} });
 });
 
-// Download via fetch proxy - solve CORS download issue
-app.get('/proxy/mp3', async (req, res) => {
-  const { url, title } = req.query;
-  if (!url) return res.status(400).json({ error: 'URL required' });
-  const safe = (title || 'audio').replace(/[^\w\s\-]/g, '').trim().slice(0, 100) || 'audio';
-  res.setHeader('Content-Disposition', `attachment; filename="${safe}.mp3"`);
-  res.setHeader('Content-Type', 'audio/mpeg');
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition, Content-Length');
-  
-  const proc = spawn('yt-dlp', [
-    '--no-warnings', '--no-playlist',
-    '-f', 'bestaudio',
-    '--extract-audio', '--audio-format', 'mp3', '--audio-quality', '128K',
-    '-o', '-', url
-  ]);
-  
-  const chunks = [];
-  proc.stdout.on('data', chunk => chunks.push(chunk));
-  proc.on('close', () => {
-    const buffer = Buffer.concat(chunks);
-    res.setHeader('Content-Length', buffer.length);
-    res.send(buffer);
-  });
-  proc.stderr.on('data', () => {});
-  proc.on('error', e => { if (!res.headersSent) res.status(500).json({ error: e.message }); });
-  req.on('close', () => { try { proc.kill(); } catch(e) {} });
-});
+
 
 app.listen(PORT, () => console.log(`MA Studio YT Engine v5 on port ${PORT}`));
