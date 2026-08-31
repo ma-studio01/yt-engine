@@ -3,12 +3,30 @@ const cors = require('cors');
 const { spawn } = require('child_process');
 const https = require('https');
 const http = require('http');
+const fs = require('fs');
+const os = require('os');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const SELF_URL = process.env.RAILWAY_PUBLIC_DOMAIN 
   ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` 
   : `http://localhost:${PORT}`;
+
+// Cache: cacheKey -> { file, size, expires }
+const audioCache = new Map();
+const CACHE_TTL = 15 * 60 * 1000; // 15 menit
+
+// Cleanup expired cache files
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of audioCache.entries()) {
+    if (now > entry.expires) {
+      try { fs.unlinkSync(entry.file); } catch(e) {}
+      audioCache.delete(key);
+    }
+  }
+}, 2 * 60 * 1000);
 
 // Keep-alive ping tiap 4 menit
 setInterval(() => {
@@ -37,7 +55,7 @@ app.use((req, res, next) => {
 app.use(express.json());
 
 app.get('/', (req, res) => {
-  res.json({ engine: 'MA Studio YT Engine', version: '5.0.0', status: 'running' });
+  res.json({ engine: 'MA Studio YT Engine', version: '6.0.0', status: 'running' });
 });
 
 app.get('/info', (req, res) => {
@@ -75,57 +93,124 @@ app.get('/download/mp3', (req, res) => {
   req.on('close', () => { try { proc.kill('SIGKILL'); } catch(e) {} });
 });
 
-app.head('/stream/mp3', (req, res) => {
+// Helper: download YT audio ke temp file, return path + size
+function downloadToTemp(ytUrl) {
+  return new Promise((resolve, reject) => {
+    const tmpFile = require('path').join(os.tmpdir(), 'mastudio_' + crypto.randomBytes(8).toString('hex') + '.mp3');
+    const proc = spawn('yt-dlp', [
+      '--no-warnings', '--no-playlist', '--no-cache-dir',
+      '--retries', '3', '--extractor-retries', '3',
+      '-f', 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
+      '--extract-audio', '--audio-format', 'mp3', '--audio-quality', '128K',
+      '-o', tmpFile, ytUrl
+    ]);
+    let stderr = '';
+    proc.stderr.on('data', d => { stderr += d.toString(); });
+    proc.on('error', reject);
+    proc.on('close', code => {
+      if (code !== 0) return reject(new Error('yt-dlp failed: ' + stderr.slice(-200)));
+      fs.stat(tmpFile, (err, stat) => {
+        if (err || !stat || stat.size < 1000) return reject(new Error('File kosong atau tidak ada'));
+        resolve({ file: tmpFile, size: stat.size });
+      });
+    });
+  });
+}
+
+// In-progress downloads: prevent duplicate downloads for same URL
+const inProgress = new Map();
+
+// HEAD untuk stream - browser mobile butuh ini
+app.head('/stream/mp3', async (req, res) => {
+  const { url } = req.query;
+  if (!url) return res.status(400).end();
+  const cacheKey = crypto.createHash('md5').update(url).digest('hex');
+  if (audioCache.has(cacheKey)) {
+    const entry = audioCache.get(cacheKey);
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Content-Length', entry.size);
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'public, max-age=900');
+    return res.end();
+  }
   res.setHeader('Content-Type', 'audio/mpeg');
-  res.setHeader('Accept-Ranges', 'none');
-  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Accept-Ranges', 'bytes');
   res.end();
 });
 
-app.get('/stream/mp3', (req, res) => {
+// GET stream - download ke temp file dulu, serve dengan Content-Length (mobile friendly)
+app.get('/stream/mp3', async (req, res) => {
   const { url } = req.query;
   if (!url) return res.status(400).json({ error: 'URL required' });
 
-  res.setHeader('Content-Type', 'audio/mpeg');
-  res.setHeader('Accept-Ranges', 'none');
-  res.setHeader('Cache-Control', 'no-cache, no-store');
-  res.setHeader('X-Accel-Buffering', 'no');
-  res.setHeader('Transfer-Encoding', 'chunked');
+  const cacheKey = crypto.createHash('md5').update(url).digest('hex');
 
-  let headersSent = false;
-  let stderr = '';
+  try {
+    let entry;
 
-  const proc = spawn('yt-dlp', [
-    '--no-warnings', '--no-playlist', '--no-cache-dir',
-    '--retries', '3',
-    '--extractor-retries', '3',
-    '-f', 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
-    '--extract-audio', '--audio-format', 'mp3', '--audio-quality', '128K',
-    '-o', '-', url
-  ]);
-
-  proc.stdout.on('data', chunk => {
-    if (!headersSent) { headersSent = true; }
-    if (!res.writableEnded) res.write(chunk);
-  });
-
-  proc.stderr.on('data', d => { stderr += d.toString(); });
-
-  proc.on('error', e => {
-    console.error('[stream/mp3] spawn error:', e.message);
-    if (!res.headersSent) res.status(500).json({ error: e.message });
-  });
-
-  proc.on('close', code => {
-    if (code !== 0 && !headersSent) {
-      console.error('[stream/mp3] yt-dlp failed, code:', code, stderr.slice(-300));
-      if (!res.headersSent) res.status(500).json({ error: 'yt-dlp failed: ' + stderr.slice(-200) });
+    if (audioCache.has(cacheKey)) {
+      // Cache hit
+      entry = audioCache.get(cacheKey);
+      entry.expires = Date.now() + CACHE_TTL; // refresh TTL
+      console.log('[stream/mp3] cache hit:', cacheKey);
+    } else if (inProgress.has(cacheKey)) {
+      // Tunggu download yang sedang berjalan
+      console.log('[stream/mp3] waiting for in-progress download:', cacheKey);
+      entry = await inProgress.get(cacheKey);
     } else {
-      if (!res.writableEnded) res.end();
+      // Download baru
+      console.log('[stream/mp3] downloading:', url);
+      const promise = downloadToTemp(url).then(result => {
+        const cacheEntry = { file: result.file, size: result.size, expires: Date.now() + CACHE_TTL };
+        audioCache.set(cacheKey, cacheEntry);
+        inProgress.delete(cacheKey);
+        return cacheEntry;
+      }).catch(err => {
+        inProgress.delete(cacheKey);
+        throw err;
+      });
+      inProgress.set(cacheKey, promise);
+      entry = await promise;
     }
-  });
 
-  req.on('close', () => { try { proc.kill('SIGKILL'); } catch(e) {} });
+    // Serve file dengan proper headers
+    const rangeHeader = req.headers.range;
+    const fileSize = entry.size;
+
+    if (rangeHeader) {
+      // Support range request (mobile browser sering pakai ini)
+      const parts = rangeHeader.replace(/bytes=/, '').split('-');
+      const start = parseInt(parts[0], 10);
+      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+      const chunkSize = end - start + 1;
+
+      res.status(206);
+      res.setHeader('Content-Range', `bytes ${start}-${end}/${fileSize}`);
+      res.setHeader('Accept-Ranges', 'bytes');
+      res.setHeader('Content-Length', chunkSize);
+      res.setHeader('Content-Type', 'audio/mpeg');
+      res.setHeader('Cache-Control', 'public, max-age=900');
+
+      const stream = fs.createReadStream(entry.file, { start, end });
+      stream.pipe(res);
+      stream.on('error', () => { if (!res.writableEnded) res.end(); });
+    } else {
+      // Full file
+      res.status(200);
+      res.setHeader('Content-Type', 'audio/mpeg');
+      res.setHeader('Content-Length', fileSize);
+      res.setHeader('Accept-Ranges', 'bytes');
+      res.setHeader('Cache-Control', 'public, max-age=900');
+
+      const stream = fs.createReadStream(entry.file);
+      stream.pipe(res);
+      stream.on('error', () => { if (!res.writableEnded) res.end(); });
+    }
+
+  } catch(err) {
+    console.error('[stream/mp3] error:', err.message);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  }
 });
 
 app.post('/publish/roblox', async (req, res) => {
@@ -215,4 +300,4 @@ app.post('/publish/roblox', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`MA Studio YT Engine v5 on port ${PORT}`));
+app.listen(PORT, () => console.log(`MA Studio YT Engine v6 on port ${PORT}`));
