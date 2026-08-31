@@ -1,23 +1,38 @@
 const express = require('express');
 const cors = require('cors');
 const { spawn } = require('child_process');
+const http = require('http');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const SELF_URL = process.env.RAILWAY_PUBLIC_DOMAIN 
+  ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` 
+  : `http://localhost:${PORT}`;
 
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['*'] }));
 app.use(express.json());
 
+// Keep-alive: ping diri sendiri tiap 4 menit
+setInterval(() => {
+  try {
+    const url = new URL(SELF_URL);
+    const options = { hostname: url.hostname, port: url.port || (url.protocol === 'https:' ? 443 : 80), path: '/', method: 'GET' };
+    const req = (url.protocol === 'https:' ? require('https') : http).request(options);
+    req.on('error', () => {});
+    req.end();
+    console.log(`[keep-alive] ping ${SELF_URL}`);
+  } catch(e) {}
+}, 4 * 60 * 1000);
+
 app.get('/', (req, res) => {
   res.json({
     engine: 'MA Studio YT Engine',
-    version: '3.0.0',
+    version: '4.0.0',
     status: 'running',
     endpoints: ['/info', '/download/mp3', '/stream/mp3']
   });
 });
 
-// Info video
 app.get('/info', (req, res) => {
   const { url } = req.query;
   if (!url) return res.status(400).json({ error: 'URL required' });
@@ -33,7 +48,6 @@ app.get('/info', (req, res) => {
   });
 });
 
-// Download MP3 - buka di tab baru, langsung download
 app.get('/download/mp3', (req, res) => {
   const { url, title } = req.query;
   if (!url) return res.status(400).json({ error: 'URL required' });
@@ -46,9 +60,9 @@ app.get('/download/mp3', (req, res) => {
   proc.stdout.pipe(res);
   proc.stderr.on('data', () => {});
   proc.on('error', e => { if (!res.headersSent) res.status(500).json({ error: e.message }); });
+  req.on('close', () => proc.kill());
 });
 
-// Stream MP3 - untuk play di editor (dengan range support)
 app.get('/stream/mp3', (req, res) => {
   const { url } = req.query;
   if (!url) return res.status(400).json({ error: 'URL required' });
@@ -64,4 +78,4 @@ app.get('/stream/mp3', (req, res) => {
   req.on('close', () => proc.kill());
 });
 
-app.listen(PORT, () => console.log(`MA Studio YT Engine v3 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`MA Studio YT Engine v4 running on port ${PORT} | keep-alive: ${SELF_URL}`));
