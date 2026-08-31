@@ -127,7 +127,7 @@ app.post('/publish/roblox', async (req, res) => {
       assetType: 'Audio',
       displayName: name,
       description: 'Uploaded via MA Studio',
-      creationContext: { creator: { userId: '' } }
+      creationContext: { creator: {} }
     });
 
     const bodyParts = [];
