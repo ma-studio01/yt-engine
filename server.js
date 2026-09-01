@@ -1,284 +1,325 @@
 const express = require('express');
-const cors = require('cors');
 const { spawn } = require('child_process');
 const https = require('https');
 const http = require('http');
 const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
+const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const SELF_URL = process.env.RAILWAY_PUBLIC_DOMAIN 
-  ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` 
+const SELF_URL = process.env.RAILWAY_PUBLIC_DOMAIN
+  ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
   : `http://localhost:${PORT}`;
 
-// Cache: cacheKey -> { file, size, expires }
-const audioCache = new Map();
-const CACHE_TTL = 15 * 60 * 1000; // 15 menit
+// Cookies dari environment variable — paste isi cookies.txt ke YOUTUBE_COOKIES di Railway
+const COOKIES_CONTENT = process.env.YOUTUBE_COOKIES || '';
+let COOKIES_FILE = null;
 
-// Cleanup expired cache files
-setInterval(() => {
-  const now = Date.now();
-  for (const [key, entry] of audioCache.entries()) {
-    if (now > entry.expires) {
-      try { fs.unlinkSync(entry.file); } catch(e) {}
-      audioCache.delete(key);
-    }
-  }
-}, 2 * 60 * 1000);
+// Tulis cookies ke temp file kalau ada
+if (COOKIES_CONTENT.trim()) {
+  COOKIES_FILE = path.join(os.tmpdir(), 'yt_cookies.txt');
+  fs.writeFileSync(COOKIES_FILE, COOKIES_CONTENT, 'utf8');
+  console.log('[cookies] Loaded from env var, size:', COOKIES_CONTENT.length);
+} else {
+  console.log('[cookies] No cookies set — yt-dlp will run without login');
+}
 
-// Keep-alive ping tiap 4 menit
-setInterval(() => {
-  try {
-    const url = new URL(SELF_URL);
-    const mod = url.protocol === 'https:' ? https : http;
-    const req = mod.request({ hostname: url.hostname, path: '/', method: 'GET' });
-    req.on('error', () => {});
-    req.end();
-  } catch(e) {}
-}, 4 * 60 * 1000);
-
+// ─── CORS ────────────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
-  const origin = req.headers.origin || '*';
-  res.setHeader('Access-Control-Allow-Origin', origin);
-  res.setHeader('Access-Control-Allow-Credentials', 'true');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, HEAD');
-  res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Range, Authorization');
-  res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition, Content-Length, Content-Type, Content-Range, Accept-Ranges');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, HEAD, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Origin, Content-Type, Accept, Range');
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges, Content-Type');
   res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-  res.setHeader('Cross-Origin-Embedder-Policy', 'unsafe-none');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
 
 app.use(express.json());
 
-app.get('/', (req, res) => {
-  res.json({ engine: 'MA Studio YT Engine', version: '6.0.0', status: 'running' });
+// ─── KEEP ALIVE ──────────────────────────────────────────────────────────────
+setInterval(() => {
+  try {
+    const u = new URL(SELF_URL);
+    const mod = u.protocol === 'https:' ? https : http;
+    const r = mod.request({ hostname: u.hostname, path: '/', method: 'GET' });
+    r.on('error', () => {});
+    r.end();
+  } catch (e) {}
+}, 4 * 60 * 1000);
+
+// ─── CACHE ───────────────────────────────────────────────────────────────────
+const cache = new Map();
+const CACHE_TTL = 20 * 60 * 1000;
+const inFlight = new Map();
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of cache.entries()) {
+    if (now > v.expires) {
+      try { fs.unlinkSync(v.file); } catch (_) {}
+      cache.delete(k);
+    }
+  }
+}, 3 * 60 * 1000);
+
+// ─── YT-DLP ARGS ─────────────────────────────────────────────────────────────
+function buildArgs(videoUrl, outFile) {
+  const args = [
+    '--no-warnings',
+    '--no-playlist',
+    '--no-cache-dir',
+    '--retries', '5',
+    '--extractor-retries', '5',
+    '--socket-timeout', '30',
+    // Android client — paling susah di-block YouTube
+    '--extractor-args', 'youtube:player_client=android,web',
+    '-f', 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
+    '--extract-audio',
+    '--audio-format', 'mp3',
+    '--audio-quality', '128K',
+  ];
+
+  // Pakai cookies kalau ada — ini yang bikin bypass bot detection
+  if (COOKIES_FILE && fs.existsSync(COOKIES_FILE)) {
+    args.push('--cookies', COOKIES_FILE);
+  }
+
+  args.push('-o', outFile, videoUrl);
+  return args;
+}
+
+// ─── DOWNLOAD TO TEMP FILE ───────────────────────────────────────────────────
+async function downloadAudio(videoUrl) {
+  const videoId = videoUrl.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/)?.[1]
+    || crypto.randomBytes(4).toString('hex');
+  const cacheKey = crypto.createHash('md5').update(videoId).digest('hex');
+
+  if (cache.has(cacheKey)) {
+    const entry = cache.get(cacheKey);
+    entry.expires = Date.now() + CACHE_TTL;
+    return entry;
+  }
+
+  if (inFlight.has(cacheKey)) return inFlight.get(cacheKey);
+
+  const promise = new Promise((resolve, reject) => {
+    const tmpFile = path.join(os.tmpdir(), `ma_${cacheKey}.mp3`);
+
+    if (fs.existsSync(tmpFile)) {
+      const stat = fs.statSync(tmpFile);
+      if (stat.size > 10000) {
+        const entry = { file: tmpFile, size: stat.size, expires: Date.now() + CACHE_TTL };
+        cache.set(cacheKey, entry);
+        return resolve(entry);
+      }
+      try { fs.unlinkSync(tmpFile); } catch (_) {}
+    }
+
+    const args = buildArgs(videoUrl, tmpFile);
+    console.log('[yt-dlp] downloading:', videoId, COOKIES_FILE ? '(with cookies)' : '(no cookies)');
+
+    const proc = spawn('yt-dlp', args);
+    let stderr = '';
+    proc.stderr.on('data', d => { stderr += d.toString(); });
+
+    proc.on('error', err => {
+      inFlight.delete(cacheKey);
+      reject(new Error('yt-dlp not found: ' + err.message));
+    });
+
+    proc.on('close', code => {
+      inFlight.delete(cacheKey);
+
+      if (code !== 0) {
+        console.error('[yt-dlp] FAILED:', videoId, '\n', stderr.slice(-400));
+        try { fs.unlinkSync(tmpFile); } catch (_) {}
+
+        let errMsg = 'Download gagal.';
+        if (stderr.includes('Sign in') || stderr.includes('bot')) errMsg = 'YouTube minta verifikasi. Tambahkan cookies di Railway.';
+        else if (stderr.includes('Private video')) errMsg = 'Video private, tidak bisa didownload.';
+        else if (stderr.includes('not available')) errMsg = 'Video tidak tersedia di region ini.';
+        return reject(new Error(errMsg));
+      }
+
+      // Cari file hasil (yt-dlp kadang rename saat convert)
+      let finalFile = tmpFile;
+      if (!fs.existsSync(tmpFile)) {
+        const files = fs.readdirSync(os.tmpdir())
+          .filter(f => f.startsWith(`ma_${cacheKey}`))
+          .map(f => ({ f, t: fs.statSync(path.join(os.tmpdir(), f)).mtimeMs }))
+          .sort((a, b) => b.t - a.t);
+        if (files.length > 0) finalFile = path.join(os.tmpdir(), files[0].f);
+      }
+
+      try {
+        const stat = fs.statSync(finalFile);
+        if (stat.size < 5000) throw new Error('File terlalu kecil');
+        const entry = { file: finalFile, size: stat.size, expires: Date.now() + CACHE_TTL };
+        cache.set(cacheKey, entry);
+        console.log('[yt-dlp] done:', videoId, Math.round(stat.size / 1024) + 'KB');
+        resolve(entry);
+      } catch (e) {
+        reject(new Error('File hasil tidak valid: ' + e.message));
+      }
+    });
+  });
+
+  inFlight.set(cacheKey, promise);
+  return promise;
+}
+
+// ─── SERVE FILE WITH RANGE SUPPORT ──────────────────────────────────────────
+function serveFile(entry, req, res, contentType) {
+  const { file, size } = entry;
+  const range = req.headers.range;
+
+  if (range) {
+    const [s, e] = range.replace(/bytes=/, '').split('-');
+    const start = parseInt(s, 10);
+    const end = e ? parseInt(e, 10) : size - 1;
+    const chunkSize = end - start + 1;
+    res.writeHead(206, {
+      'Content-Type': contentType,
+      'Content-Range': `bytes ${start}-${end}/${size}`,
+      'Accept-Ranges': 'bytes',
+      'Content-Length': chunkSize,
+      'Cache-Control': 'public, max-age=1200',
+    });
+    fs.createReadStream(file, { start, end }).pipe(res);
+  } else {
+    res.writeHead(200, {
+      'Content-Type': contentType,
+      'Content-Length': size,
+      'Accept-Ranges': 'bytes',
+      'Cache-Control': 'public, max-age=1200',
+    });
+    fs.createReadStream(file).pipe(res);
+  }
+}
+
+// ─── ROUTES ──────────────────────────────────────────────────────────────────
+
+app.get('/', (_, res) => {
+  res.json({
+    engine: 'MA Studio Engine',
+    version: '8.0.0',
+    status: 'running',
+    cookies: COOKIES_FILE ? 'loaded' : 'none',
+  });
 });
 
 app.get('/info', (req, res) => {
   const { url } = req.query;
   if (!url) return res.status(400).json({ error: 'URL required' });
-  let output = '';
-  const proc = spawn('yt-dlp', ['--no-warnings', '--no-playlist', '--print',
-    '%(title)s|||%(uploader)s|||%(duration)s|||%(thumbnail)s|||%(id)s', '--no-download', url]);
-  proc.stdout.on('data', d => output += d.toString());
+
+  const args = ['--no-warnings', '--no-playlist',
+    '--extractor-args', 'youtube:player_client=android',
+    '--print', '%(title)s|||%(uploader)s|||%(duration)s|||%(thumbnail)s|||%(id)s',
+    '--no-download'];
+  if (COOKIES_FILE) args.push('--cookies', COOKIES_FILE);
+  args.push(url);
+
+  let out = '';
+  const proc = spawn('yt-dlp', args);
+  proc.stdout.on('data', d => out += d.toString());
   proc.on('close', code => {
-    if (code !== 0 || !output.trim()) return res.status(500).json({ error: 'Failed' });
-    const p = output.trim().split('|||');
-    res.json({ title: p[0]||'', author: p[1]||'', duration: parseInt(p[2])||0, thumbnail: p[3]||'', videoId: p[4]||'' });
+    if (code !== 0 || !out.trim()) return res.status(500).json({ error: 'Gagal ambil info' });
+    const [title, author, dur, thumb, id] = out.trim().split('|||');
+    res.json({ title: title || '', author: author || '', duration: parseInt(dur) || 0, thumbnail: thumb || '', videoId: id || '' });
   });
 });
 
-app.get('/download/mp3', (req, res) => {
-  const { url, title } = req.query;
-  if (!url) return res.status(400).json({ error: 'URL required' });
-  const safe = (title || 'audio').replace(/[^\w\s\-]/g, '').trim().slice(0, 100) || 'audio';
-  res.setHeader('Content-Disposition', `attachment; filename="${safe}.mp3"`);
-  res.setHeader('Content-Type', 'audio/mpeg');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('X-Accel-Buffering', 'no');
-  const proc = spawn('yt-dlp', [
-    '--no-warnings', '--no-playlist',
-    '-f', 'bestaudio[ext=m4a]/bestaudio',
-    '--extract-audio', '--audio-format', 'mp3', '--audio-quality', '128K',
-    '-o', '-', url
-  ]);
-  proc.stdout.pipe(res);
-  proc.stderr.on('data', () => {});
-  proc.on('error', e => { if (!res.headersSent) res.status(500).json({ error: e.message }); });
-  proc.on('close', () => { if (!res.writableEnded) res.end(); });
-  req.on('close', () => { try { proc.kill('SIGKILL'); } catch(e) {} });
-});
-
-// Helper: download YT audio ke temp file, return path + size
-function downloadToTemp(ytUrl) {
-  return new Promise((resolve, reject) => {
-    const tmpFile = require('path').join(os.tmpdir(), 'mastudio_' + crypto.randomBytes(8).toString('hex') + '.mp3');
-    const proc = spawn('yt-dlp', [
-      '--no-warnings', '--no-playlist', '--no-cache-dir',
-      '--retries', '3', '--extractor-retries', '3',
-      '-f', 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
-      '--extract-audio', '--audio-format', 'mp3', '--audio-quality', '128K',
-      '-o', tmpFile, ytUrl
-    ]);
-    let stderr = '';
-    proc.stderr.on('data', d => { stderr += d.toString(); });
-    proc.on('error', reject);
-    proc.on('close', code => {
-      if (code !== 0) return reject(new Error('yt-dlp failed: ' + stderr.slice(-200)));
-      fs.stat(tmpFile, (err, stat) => {
-        if (err || !stat || stat.size < 1000) return reject(new Error('File kosong atau tidak ada'));
-        resolve({ file: tmpFile, size: stat.size });
-      });
-    });
-  });
-}
-
-// In-progress downloads: prevent duplicate downloads for same URL
-const inProgress = new Map();
-
-// HEAD untuk stream - browser mobile butuh ini
-app.head('/stream/mp3', async (req, res) => {
-  const { url } = req.query;
-  if (!url) return res.status(400).end();
-  const cacheKey = crypto.createHash('md5').update(url).digest('hex');
-  if (audioCache.has(cacheKey)) {
-    const entry = audioCache.get(cacheKey);
-    res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Content-Length', entry.size);
-    res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('Cache-Control', 'public, max-age=900');
-    return res.end();
-  }
-  res.setHeader('Content-Type', 'audio/mpeg');
-  res.setHeader('Accept-Ranges', 'bytes');
-  res.end();
-});
-
-// GET stream - download ke temp file dulu, serve dengan Content-Length (mobile friendly)
 app.get('/stream/mp3', async (req, res) => {
   const { url } = req.query;
   if (!url) return res.status(400).json({ error: 'URL required' });
-
-  const cacheKey = crypto.createHash('md5').update(url).digest('hex');
-
   try {
-    let entry;
+    const entry = await downloadAudio(url);
+    serveFile(entry, req, res, 'audio/mpeg');
+  } catch (err) {
+    console.error('[/stream/mp3]', err.message);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  }
+});
 
-    if (audioCache.has(cacheKey)) {
-      // Cache hit
-      entry = audioCache.get(cacheKey);
-      entry.expires = Date.now() + CACHE_TTL; // refresh TTL
-      console.log('[stream/mp3] cache hit:', cacheKey);
-    } else if (inProgress.has(cacheKey)) {
-      // Tunggu download yang sedang berjalan
-      console.log('[stream/mp3] waiting for in-progress download:', cacheKey);
-      entry = await inProgress.get(cacheKey);
-    } else {
-      // Download baru
-      console.log('[stream/mp3] downloading:', url);
-      const promise = downloadToTemp(url).then(result => {
-        const cacheEntry = { file: result.file, size: result.size, expires: Date.now() + CACHE_TTL };
-        audioCache.set(cacheKey, cacheEntry);
-        inProgress.delete(cacheKey);
-        return cacheEntry;
-      }).catch(err => {
-        inProgress.delete(cacheKey);
-        throw err;
-      });
-      inProgress.set(cacheKey, promise);
-      entry = await promise;
-    }
+app.head('/stream/mp3', async (req, res) => {
+  const { url } = req.query;
+  if (!url) return res.status(400).end();
+  try {
+    const entry = await downloadAudio(url);
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Content-Length', entry.size);
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.end();
+  } catch { res.status(500).end(); }
+});
 
-    // Serve file dengan proper headers
-    const rangeHeader = req.headers.range;
-    const fileSize = entry.size;
-
-    if (rangeHeader) {
-      // Support range request (mobile browser sering pakai ini)
-      const parts = rangeHeader.replace(/bytes=/, '').split('-');
-      const start = parseInt(parts[0], 10);
-      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-      const chunkSize = end - start + 1;
-
-      res.status(206);
-      res.setHeader('Content-Range', `bytes ${start}-${end}/${fileSize}`);
-      res.setHeader('Accept-Ranges', 'bytes');
-      res.setHeader('Content-Length', chunkSize);
-      res.setHeader('Content-Type', 'audio/mpeg');
-      res.setHeader('Cache-Control', 'public, max-age=900');
-
-      const stream = fs.createReadStream(entry.file, { start, end });
-      stream.pipe(res);
-      stream.on('error', () => { if (!res.writableEnded) res.end(); });
-    } else {
-      // Full file
-      res.status(200);
-      res.setHeader('Content-Type', 'audio/mpeg');
-      res.setHeader('Content-Length', fileSize);
-      res.setHeader('Accept-Ranges', 'bytes');
-      res.setHeader('Cache-Control', 'public, max-age=900');
-
-      const stream = fs.createReadStream(entry.file);
-      stream.pipe(res);
-      stream.on('error', () => { if (!res.writableEnded) res.end(); });
-    }
-
-  } catch(err) {
-    console.error('[stream/mp3] error:', err.message);
+app.get('/download/mp3', async (req, res) => {
+  const { url, title } = req.query;
+  if (!url) return res.status(400).json({ error: 'URL required' });
+  try {
+    const entry = await downloadAudio(url);
+    const safe = (title || 'audio').replace(/[^\w\s\-]/g, '').trim().slice(0, 100) || 'audio';
+    res.setHeader('Content-Disposition', `attachment; filename="${safe}.mp3"`);
+    serveFile(entry, req, res, 'audio/mpeg');
+  } catch (err) {
     if (!res.headersSent) res.status(500).json({ error: err.message });
   }
 });
 
 app.post('/publish/roblox', async (req, res) => {
-  const { url, title, apiKey } = req.body;
+  const { url, title, apiKey, userId } = req.body;
   if (!url) return res.status(400).json({ error: 'URL required' });
   if (!apiKey) return res.status(400).json({ error: 'API Key required' });
 
-  const name = (title || 'audio').slice(0, 100);
-
   let audioBuffer;
   try {
-    audioBuffer = await new Promise((resolve, reject) => {
-      const chunks = [];
-      const proc = spawn('yt-dlp', [
-        '--no-warnings', '--no-playlist',
-        '-f', 'bestaudio[ext=m4a]/bestaudio',
-        '--extract-audio', '--audio-format', 'mp3', '--audio-quality', '128K',
-        '-o', '-', url
-      ]);
-      proc.stdout.on('data', chunk => chunks.push(chunk));
-      proc.on('close', code => {
-        const buf = Buffer.concat(chunks);
-        if (code !== 0 || buf.length < 1000) return reject(new Error('yt-dlp gagal atau file terlalu kecil'));
-        resolve(buf);
-      });
-      proc.on('error', reject);
-    });
-  } catch(e) {
-    return res.status(500).json({ error: 'Gagal download audio: ' + e.message });
+    const entry = await downloadAudio(url);
+    audioBuffer = fs.readFileSync(entry.file);
+  } catch (e) {
+    return res.status(500).json({ error: 'Gagal download: ' + e.message });
   }
 
   try {
-    const boundary = '----MAStudioBoundary' + Date.now();
+    const name = (title || 'audio').slice(0, 100);
+    const boundary = '----MABoundary' + Date.now();
     const requestJson = JSON.stringify({
       assetType: 'Audio',
       displayName: name,
       description: 'Uploaded via MA Studio',
-      creationContext: { creator: req.body.userId ? { userId: parseInt(req.body.userId), creatorType: 'User' } : {} }
+      creationContext: { creator: userId ? { userId: parseInt(userId), creatorType: 'User' } : {} },
     });
 
-    const bodyParts = [];
-    bodyParts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="request"\r\nContent-Type: application/json\r\n\r\n${requestJson}\r\n`));
-    bodyParts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="fileContent"; filename="${name}.mp3"\r\nContent-Type: audio/mpeg\r\n\r\n`));
-    bodyParts.push(audioBuffer);
-    bodyParts.push(Buffer.from(`\r\n--${boundary}--\r\n`));
-    const body = Buffer.concat(bodyParts);
+    const body = Buffer.concat([
+      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="request"\r\nContent-Type: application/json\r\n\r\n${requestJson}\r\n`),
+      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="fileContent"; filename="${name}.mp3"\r\nContent-Type: audio/mpeg\r\n\r\n`),
+      audioBuffer,
+      Buffer.from(`\r\n--${boundary}--\r\n`),
+    ]);
 
     const uploadRes = await fetch('https://apis.roblox.com/assets/v1/assets', {
       method: 'POST',
       headers: {
         'x-api-key': apiKey,
         'Content-Type': `multipart/form-data; boundary=${boundary}`,
-        'Content-Length': body.length
+        'Content-Length': body.length,
       },
-      body
+      body,
     });
 
-    const uploadData = await uploadRes.json();
+    const data = await uploadRes.json();
     if (!uploadRes.ok) {
-      let msg = uploadData.message || uploadData.error || `HTTP ${uploadRes.status}`;
-      if (uploadRes.status === 403) msg = 'API Key tidak valid atau tidak ada permission Audio.';
+      let msg = data.message || data.error || `HTTP ${uploadRes.status}`;
+      if (uploadRes.status === 403) msg = 'API Key tidak valid atau tidak punya permission Audio.';
       if (uploadRes.status === 429) msg = 'Rate limit Roblox, tunggu beberapa menit.';
       return res.status(uploadRes.status).json({ error: msg });
     }
 
-    if (uploadData.assetId) return res.json({ assetId: uploadData.assetId });
+    if (data.assetId) return res.json({ assetId: data.assetId });
 
-    const opPath = uploadData.path || uploadData.operationId;
+    const opPath = data.path || data.operationId;
     if (!opPath) return res.status(500).json({ error: 'Respons Roblox tidak valid.' });
 
     for (let i = 0; i < 20; i++) {
@@ -291,13 +332,12 @@ app.post('/publish/roblox', async (req, res) => {
         if (assetId) return res.json({ assetId });
         return res.status(500).json({ error: 'Upload selesai tapi Asset ID tidak ditemukan.' });
       }
-      if (op.error) return res.status(500).json({ error: op.error.message || 'Upload gagal di Roblox.' });
+      if (op.error) return res.status(500).json({ error: op.error.message || 'Upload gagal.' });
     }
-    return res.status(500).json({ error: 'Timeout menunggu Roblox. Cek Creator Dashboard.' });
-
-  } catch(e) {
+    return res.status(500).json({ error: 'Timeout. Cek Roblox Creator Dashboard.' });
+  } catch (e) {
     return res.status(500).json({ error: 'Gagal upload ke Roblox: ' + e.message });
   }
 });
 
-app.listen(PORT, () => console.log(`MA Studio YT Engine v6 on port ${PORT}`));
+app.listen(PORT, () => console.log(`MA Studio Engine v8 | port ${PORT} | cookies: ${COOKIES_FILE ? 'YES' : 'NO'}`));
