@@ -39,6 +39,17 @@ app.use((req, res, next) => {
 
 app.use(express.json());
 
+// Auto-update yt-dlp saat startup — pastikan selalu versi terbaru
+const { execSync } = require('child_process');
+try {
+  console.log('[yt-dlp] Updating to latest version...');
+  execSync('yt-dlp -U', { timeout: 60000, stdio: 'pipe' });
+  const ver = execSync('yt-dlp --version', { stdio: 'pipe' }).toString().trim();
+  console.log('[yt-dlp] Version:', ver);
+} catch(e) {
+  console.warn('[yt-dlp] Update failed (ok, will use installed version):', e.message?.slice(0,100));
+}
+
 // ─── KEEP ALIVE ──────────────────────────────────────────────────────────────
 setInterval(() => {
   try {
