@@ -86,9 +86,9 @@ function buildArgs(videoUrl, outFile) {
     '--extractor-retries', '5',
     '--socket-timeout', '30',
     // Android client — paling susah di-block YouTube
-    '--extractor-args', 'youtube:player_client=android,web',
-    '-f', 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
-    '--extract-audio',
+    '--extractor-args', 'youtube:player_client=android',
+    '--format-sort', 'abr',
+    '-x',
     '--audio-format', 'mp3',
     '--audio-quality', '128K',
   ];
@@ -228,8 +228,8 @@ app.get('/info', (req, res) => {
 
   const args = ['--no-warnings', '--no-playlist',
     '--extractor-args', 'youtube:player_client=android',
-    '--print', '%(title)s|||%(uploader)s|||%(duration)s|||%(thumbnail)s|||%(id)s',
-    '--no-download'];
+    '--skip-download',
+    '--print', '%(title)s|||%(uploader)s|||%(duration)s|||%(thumbnail)s|||%(id)s'];
   if (COOKIES_FILE) args.push('--cookies', COOKIES_FILE);
   args.push(url);
 
